@@ -4730,6 +4730,36 @@ async def lanhu_get_ai_analyze_design_result(
             HTML+CSS, use the Design Token value as a supplement.
             Focus on: gradients, border styles, border-radius, opacity, shadows.
 
+        RULE 5 - POST-GENERATION FIDELITY AUDIT (MANDATORY, NEVER SKIP):
+            After generating code in ANY target platform/language (HTML/CSS, React,
+            Vue, Flutter, SwiftUI, Android Compose, etc.), perform a property-by-property
+            comparison against the design spec HTML+CSS. Map each CSS property to its
+            platform equivalent and verify the value is preserved exactly:
+              ① size constraint: fixed height in spec → must NOT become flexible/wrap
+                  HTML: height not min-height | Flutter: fixed SizedBox, not Flexible
+                  SwiftUI: .frame(height:) not omitted | Compose: height() not wrapContent
+              ② clipping: overflow:hidden in spec → must clip content in all platforms
+                  HTML: overflow:hidden | Flutter: ClipRect/ClipRRect | SwiftUI: .clipped()
+                  Compose: clip()/clipToBounds | Android: android:clipChildren="true"
+              ③ color value: rgba(r,g,b,a) must be converted to platform format exactly
+                  HTML: keep rgba() | Flutter: Color.fromRGBO() | SwiftUI: Color(red:green:blue:opacity:)
+                  Compose: Color(r,g,b,a) | Android XML: #AARRGGBB — values must not drift
+              ④ gradient: linear-gradient must map to platform gradient, not solid color
+                  Flutter: LinearGradient | SwiftUI: LinearGradient | Compose: Brush.linearGradient
+              ⑤ absolute positioning: left/top values must map to exact offsets
+                  Flutter: Positioned(left:,top:) | SwiftUI: .offset() or .position()
+                  Compose: Box+Modifier.offset() | HTML: position:absolute + left/top
+              ⑥ font: family, weight, size must all be preserved; fallback list for HTML
+              ⑦ spacing: every margin/padding direction value must be unchanged
+                  HTML: margin/padding | Flutter: EdgeInsets | SwiftUI: .padding()
+                  Compose: Modifier.padding() | Android: android:layout_margin / android:padding
+              ⑧ image assets: no image replaced by SVG/CSS shape/emoji/placeholder
+              ⑨ element completeness: every visible element in spec must appear in code
+              ⑩ no remote URLs: no lanhu CDN URLs in any generated asset path
+            For each difference found, state explicitly whether it is an intentional
+            platform adaptation (e.g. px→dp unit conversion) or an error (value changed).
+            All errors MUST be corrected before delivering the final code.
+
         DESIGN IMAGE is for visual verification ONLY. It has the LOWEST priority.
         NEVER use the design image to override any CSS value from the HTML+CSS code.
     """
@@ -4979,6 +5009,31 @@ async def lanhu_get_ai_analyze_design_result(
         summary_text += "  仅当 HTML+CSS 中明显缺失某属性时，用 Design Token 补充：\n"
         summary_text += "    如渐变填充、复杂阴影、多边圆角等 CSS 未能完整表达的属性\n"
         summary_text += "  Design Token 不能覆盖 HTML+CSS 中已有的值。\n\n"
+        summary_text += "STEP 5 - 代码完成后逐属性还原度核查（必须执行，不得跳过）：\n"
+        summary_text += "  适用于所有目标平台：HTML/CSS、React、Vue、Flutter、SwiftUI、Compose、Android XML 等。\n"
+        summary_text += "  将设计稿 HTML+CSS 中每个属性映射到目标平台等价写法，逐一核查值是否还原：\n"
+        summary_text += "  ① 尺寸约束：设计稿固定 height 的地方，目标平台不得变为自适应/wrap\n"
+        summary_text += "     HTML: height 不能改成 min-height | Flutter: SizedBox 不能换成 Flexible\n"
+        summary_text += "     SwiftUI: .frame(height:) 不能省略 | Compose: height() 不能用 wrapContent\n"
+        summary_text += "  ② 裁剪：设计稿 overflow:hidden 的容器，各平台必须同步裁剪\n"
+        summary_text += "     HTML: overflow:hidden | Flutter: ClipRect/ClipRRect | SwiftUI: .clipped()\n"
+        summary_text += "     Compose: clip() | Android: android:clipChildren=\"true\"\n"
+        summary_text += "  ③ 颜色值：rgba(r,g,b,a) 转换到目标平台格式时，数值不得偏移\n"
+        summary_text += "     HTML: 保持 rgba() | Flutter: Color.fromRGBO() | SwiftUI: Color(red:green:blue:opacity:)\n"
+        summary_text += "     Compose: Color(r,g,b,a) | Android XML: #AARRGGBB，禁止四舍五入\n"
+        summary_text += "  ④ 渐变：linear-gradient 必须映射为平台渐变，不能退化为纯色\n"
+        summary_text += "     Flutter: LinearGradient | SwiftUI: LinearGradient | Compose: Brush.linearGradient\n"
+        summary_text += "  ⑤ 绝对定位：left/top 坐标值必须原样映射\n"
+        summary_text += "     Flutter: Positioned(left:,top:) | SwiftUI: .offset() | Compose: Modifier.offset()\n"
+        summary_text += "  ⑥ 字体：family、weight、size 三者都必须还原；HTML 还需保留 fallback 顺序\n"
+        summary_text += "  ⑦ 间距：每个方向的 margin/padding 数值不得改动\n"
+        summary_text += "     Flutter: EdgeInsets | SwiftUI: .padding() | Compose: Modifier.padding()\n"
+        summary_text += "     Android: android:layout_margin / android:padding\n"
+        summary_text += "  ⑧ 图片资源：任何图片不得被 SVG/CSS形状/emoji/占位图替换\n"
+        summary_text += "  ⑨ 元素完整性：设计稿中每个可见元素，目标代码中必须对应存在\n"
+        summary_text += "  ⑩ 远程 URL：最终代码中不得残留任何蓝湖 CDN 远程地址\n"
+        summary_text += "  核查结论：对每处差异明确说明是「有意的平台适配（如 px→dp 单位换算）」\n"
+        summary_text += "  还是「错误偏差（值发生了改变）」，错误偏差必须立即修正后再交付。\n\n"
         summary_text += "❌ 严禁行为：\n"
         summary_text += "  - 禁止修改 CSS 属性值（不要改颜色格式、不要简化渐变、不要调整数值）\n"
         summary_text += "  - 禁止凭空编造设计参数（颜色、尺寸、间距等必须来自下方 CSS）\n"
@@ -5979,6 +6034,5 @@ if __name__ == "__main__":
     SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
     SERVER_PORT = int(os.getenv("SERVER_PORT", "8100"))
     mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-
 
 
