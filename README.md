@@ -357,7 +357,7 @@ AI 会自动：
 | `lanhu_get_ai_analyze_page_result` | 分析原型页面内容 | 提取需求细节 |
 | `lanhu_get_designs` | 获取UI设计图列表 | 查看设计稿前必调用 |
 | `lanhu_get_ai_analyze_design_result` | 分析UI设计图 | 查看设计稿 |
-| `lanhu_get_design_slices` | 获取切图信息 | 下载图标、素材 |
+| `lanhu_get_design_slices` | 获取切图信息 | 默认不对 AI 暴露；如需启用设置环境变量 `LANHU_ENABLE_DESIGN_SLICES_TOOL=true` |
 | `lanhu_say` | 发布留言 | 团队协作、@提醒 |
 | `lanhu_say_list` | 查看留言列表 | 查询历史消息 |
 | `lanhu_say_detail` | 查看留言详情 | 查看完整内容 |

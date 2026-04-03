@@ -77,6 +77,8 @@ VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1080"))
 # 调试模式
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+ENABLE_DESIGN_SLICES_TOOL = os.getenv("LANHU_ENABLE_DESIGN_SLICES_TOOL", "false").lower() == "true"
+
 # 角色枚举（用于识别用户身份）
 VALID_ROLES = ["后端", "前端", "客户端", "开发", "运维", "产品", "项目经理"]
 
@@ -504,6 +506,49 @@ def _generate_html(
         return f'{spaces}<{tag} class="{all_classes}">\n{children_html}\n{spaces}</{tag}>'
     return f'{spaces}<{tag} class="{all_classes}"></{tag}>'
 
+
+def convert_lanhu_to_design_json(node: dict) -> dict:
+    if not node:
+        return {}
+
+    node_type = node.get('type', 'group')
+    node_id = node.get('id', '')
+    props = node.get('props', {})
+    style = props.get('style', {})
+
+    result = {
+        "nodeType": node_type,
+        "id": node_id,
+        "name": props.get('className', f"element_{node_id}"),
+    }
+
+    x = style.get('left', 0)
+    y = style.get('top', 0)
+    w = style.get('width', 0)
+    h = style.get('height', 0)
+    result["bounds"] = {"x": x, "y": y, "width": w, "height": h}
+
+    text_value = node.get('data', {}).get('value') or props.get('text')
+    if node_type == 'lanhutext' and text_value is not None:
+        result['text'] = str(text_value)
+
+    image_src = node.get('data', {}).get('value') or props.get('src')
+    if node_type == 'lanhuimage' and image_src:
+        result['src'] = image_src
+
+    style_keys = [
+        'color', 'fontSize', 'fontFamily', 'fontWeight', 'textAlign', 'lineHeight',
+        'backgroundColor', 'backgroundImage', 'borderRadius', 'border', 'boxShadow', 'opacity'
+    ]
+    result_style = {k: style[k] for k in style_keys if k in style}
+    if result_style:
+        result['style'] = result_style
+
+    children = node.get('children', [])
+    if children:
+        result['children'] = [convert_lanhu_to_design_json(c) for c in children if c]
+
+    return result
 
 def convert_lanhu_to_html(json_data: dict) -> str:
     """
@@ -1476,6 +1521,54 @@ def minify_html(html: str) -> str:
         remove_empty_space=True,
     )
 
+
+def _localize_json_urls(json_tree: dict, design_name: str) -> tuple[dict, dict]:
+    """
+    将生成的 JSON 中的远程图片 URL 替换为本地路径占位符，并返回下载映射表。
+    处理 "src": "http..." 和 "backgroundImage": "url(http...)" 等情况。
+    """
+    url_mapping = {}
+    counter = [0]
+
+    def _make_local_name(remote_url: str) -> str:
+        parsed = urlparse(remote_url)
+        path = parsed.path
+        ext = '.png'
+        if '.' in path.split('/')[-1]:
+            ext = '.' + path.split('/')[-1].rsplit('.', 1)[-1]
+            if ext.lower() not in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'):
+                ext = '.png'
+        counter[0] += 1
+        return f"img_{counter[0]}{ext}"
+
+    def _replace_css_url(match):
+        url = match.group(1).strip('\'"')
+        if not url or not url.startswith('http'):
+            return match.group(0)
+        local_name = _make_local_name(url)
+        local_path = f"./assets/slices/{local_name}"
+        url_mapping[local_path] = url
+        return f"url('{local_path}')"
+
+    def _traverse(node):
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                if isinstance(value, str):
+                    if key in ('src', 'url', 'image') and value.startswith('http'):
+                        local_name = _make_local_name(value)
+                        local_path = f"./assets/slices/{local_name}"
+                        url_mapping[local_path] = value
+                        node[key] = local_path
+                    elif key == 'backgroundImage' and 'url(' in value:
+                        node[key] = re.sub(r'url\(([\'"]*https?://[^\)]*)\)', _replace_css_url, value)
+                elif isinstance(value, (dict, list)):
+                    _traverse(value)
+        elif isinstance(node, list):
+            for item in node:
+                _traverse(item)
+
+    _traverse(json_tree)
+    return json_tree, url_mapping
 
 def _localize_image_urls(html_code: str, design_name: str) -> tuple[str, dict]:
     """
@@ -2749,7 +2842,7 @@ class LanhuExtractor:
             pass
 
     async def get_design_slices_info(self, image_id: str, team_id: str, project_id: str,
-                                     include_metadata: bool = True) -> dict:
+                                     include_metadata: bool = True, slice_scope: str = "marked_only") -> dict:
         """
         获取设计图的所有切图信息（仅返回元数据和下载地址，不下载文件）
 
@@ -2758,6 +2851,7 @@ class LanhuExtractor:
             team_id: 团队ID
             project_id: 项目ID
             include_metadata: 是否包含详细元数据（位置、颜色、样式等）
+            slice_scope: 切图范围。'marked_only' 仅返回蓝湖明确标注切图；'all' 返回全部可下载切图
 
         Returns:
             包含切图列表和详细信息的字典
@@ -2784,6 +2878,47 @@ class LanhuExtractor:
         json_response = await self.client.get(json_url)
         sketch_data = json_response.json()
 
+        normalized_slice_scope = str(slice_scope or "marked_only").strip().lower()
+        if normalized_slice_scope not in ("marked_only", "all"):
+            normalized_slice_scope = "marked_only"
+
+        def _to_bool(value) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "y", "on", "enabled")
+            return False
+
+        def _contains_slice_keyword(value) -> bool:
+            if value is None:
+                return False
+            text = str(value).strip().lower()
+            return ("slice" in text) or ("切图" in text)
+
+        def _is_marked_slice_layer(obj: dict) -> bool:
+            direct_flags = [
+                "isSlice", "slice", "sliceable", "isSliceable", "sliceEnabled",
+                "isExport", "isExportable", "exportable", "needExport", "exportEnabled",
+                "isCut", "cuttable", "isMarkedSlice", "markedSlice"
+            ]
+            for key in direct_flags:
+                if key in obj and _to_bool(obj.get(key)):
+                    return True
+            for key, value in obj.items():
+                key_lower = str(key).lower()
+                if any(token in key_lower for token in ("slice", "export", "cut")):
+                    if _to_bool(value):
+                        return True
+                    if isinstance(value, str) and _contains_slice_keyword(value):
+                        return True
+            type_fields = [
+                obj.get("type"), obj.get("layerType"), obj.get("ddsType"),
+                obj.get("class"), obj.get("_class"), obj.get("name")
+            ]
+            return any(_contains_slice_keyword(v) for v in type_fields)
+
         # 3. 递归提取所有切图
         slices = []
 
@@ -2807,7 +2942,8 @@ class LanhuExtractor:
             current_path = f"{layer_path}/{current_name}" if layer_path else current_name
 
             # 新版结构: 检查 image 字段 (优先)
-            if obj.get('image') and (obj['image'].get('imageUrl') or obj['image'].get('svgUrl')):
+            if obj.get('image') and (obj['image'].get('imageUrl') or obj['image'].get('svgUrl')) and (
+                    normalized_slice_scope == "all" or _is_marked_slice_layer(obj)):
                 image_data = obj['image']
 
                 # 优先使用PNG格式，如果没有则使用SVG
@@ -2881,7 +3017,8 @@ class LanhuExtractor:
                 slices.append(slice_info)
 
             # 旧版结构: 检查 ddsImage 字段 (兼容)
-            elif obj.get('ddsImage') and obj['ddsImage'].get('imageUrl'):
+            elif obj.get('ddsImage') and obj['ddsImage'].get('imageUrl') and (
+                    normalized_slice_scope == "all" or _is_marked_slice_layer(obj)):
                 slice_info = {
                     'id': obj.get('id'),
                     'name': current_name,
@@ -2969,6 +3106,7 @@ class LanhuExtractor:
         return {
             'design_id': image_id,
             'design_name': result['name'],
+            'slice_scope': normalized_slice_scope,
             'version': latest_version['version_info'],
             'canvas_size': {
                 'width': result.get('width'),
@@ -4638,10 +4776,11 @@ async def lanhu_get_designs(
 async def lanhu_get_ai_analyze_design_result(
         url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
         design_names: Annotated[Union[str, List[str]], "Design name(s) or index number(s). 'all' = all designs. Number (e.g. 6) = the 6th item in lanhu_get_designs list (by 'index' field), NOT by name prefix. Exact name (e.g. '6_friend页_挂件墙') = match by full name. Get names/index from lanhu_get_designs first."],
+        output_format: Annotated[str, "Output format: 'html' only. JSON branch is temporarily disabled."] = "html",
         ctx: Context = None
 ) -> List[Union[str, Image]]:
     """
-    [UI Design] Analyze Lanhu UI design images - GET VISUAL CONTENT + HTML CODE
+    [UI Design] Analyze Lanhu UI design images - GET VISUAL CONTENT + STRUCTURED DATA
     
     USE THIS WHEN user says: UI设计图, 设计图, 设计稿, 视觉设计, UI稿, 看看设计, 帮我看设计图, 设计评审
     DO NOT USE for: 需求文档, PRD, 原型, 交互稿, Axure (use lanhu_get_ai_analyze_page_result instead)
@@ -4650,118 +4789,10 @@ async def lanhu_get_ai_analyze_design_result(
     WORKFLOW: First call lanhu_get_designs to get design list, then call this to analyze specific designs.
     
     Returns:
-        Visual representation of UI design images AND HTML+CSS code for each design.
-        First block: summary text with "设计图 1/2/3..." and each design's HTML code.
-        Following blocks: images in the same order as 设计图 1, 2, 3... (image N = design N).
-        
-    CRITICAL - How to use the returned HTML+CSS (MUST follow this workflow):
-
-        ⚠️ AUTHORITY PRIORITY (highest → lowest):
-            1. HTML+CSS code  — the PRIMARY source of truth for all visual parameters
-            2. Design Tokens  — supplementary reference for gradients/borders/shadows
-            3. Design Image   — visual verification ONLY, never override CSS values
-
-        The returned HTML+CSS is the DESIGN SPECIFICATION generated from design schema.
-        Every CSS property value (color, size, spacing, font, gradient, border-radius,
-        etc.) is extracted from the original design data and MUST be used as-is.
-
-        RULE 1 - HTML+CSS IS DESIGN SPEC, COPY CSS VALUES DIRECTLY:
-            The CSS values are the single source of truth for all design parameters.
-            You MUST directly copy/reuse the exact CSS property values from the code.
-            DO NOT modify, simplify, or "improve" any CSS value. Specifically:
-              - DO NOT change rgba() to hex or vice versa (keep rgba(255,115,10,1) as-is)
-              - DO NOT round or simplify numbers (keep 0.30000001192092896 as-is)
-              - DO NOT replace linear-gradient with solid colors
-              - DO NOT change font-family order or remove fallback fonts
-              - DO NOT adjust margin/padding values for "cleaner" numbers
-              - DO NOT replace any img src or background-url with SVG, CSS shapes, or emoji
-              - DO NOT omit any visual element from the design
-            The HTML DOM structure and class names indicate layout intent (flex-row=Row,
-            flex-col=Column, justify-between=SpaceBetween, etc.), adapt them to the
-            target framework's component model while keeping all CSS values unchanged.
-
-        RULE 2 - DETECT USER PROJECT AND GENERATE FRAMEWORK-APPROPRIATE CODE:
-            STEP 1: Read project config files (package.json, tsconfig.json, pubspec.yaml,
-                    build.gradle, Podfile, etc.) to detect framework and styling approach.
-            STEP 2: Generate code matching the detected framework:
-              - React/Next.js  → JSX component + CSS Modules / styled-components / Tailwind
-              - Vue/Nuxt       → Single File Component (.vue) with <style scoped>
-              - Angular        → component.ts + component.html + component.css
-              - Svelte         → Component.svelte with <style>
-              - Flutter        → StatelessWidget with EdgeInsets, BoxDecoration, etc.
-              - SwiftUI        → View struct with ViewModifier
-              - Android Compose→ @Composable function with Modifier
-              - Plain HTML     → Single self-contained .html file with inline <style>
-            STEP 3: Follow the project's existing conventions (file naming, directory
-                    structure, styling approach). If no framework detected, default to
-                    plain HTML single file.
-            CSS-to-platform property mapping reference:
-              width/height px    → Android: dp, iOS: pt, Flutter: logical pixels
-              font-size px       → Android: sp, iOS: pt, Flutter: fontSize
-              margin/padding     → Keep proportions, convert px to dp/pt
-              border-radius      → Android: dp, iOS: cornerRadius, Flutter: BorderRadius
-              color rgba()       → Android: Color.argb(), iOS: UIColor, Flutter: Color
-              linear-gradient    → Android: GradientDrawable, iOS: CAGradientLayer
-              flex-row / flex-col→ Row/Column (Flutter), HStack/VStack (SwiftUI)
-              position:absolute  → Stack+Positioned (Flutter), ZStack (SwiftUI)
-
-        RULE 3 - IMAGE ASSETS USE LOCAL PATHS (MANDATORY):
-            The returned HTML+CSS already uses LOCAL paths (./assets/slices/xxx.png)
-            for all image resources. A download mapping table is provided below each
-            design's HTML code, listing: local_path ← remote_download_url.
-            You MUST:
-              1. Download ALL images from the mapping table to the project's local
-                 assets directory BEFORE generating final code.
-              2. Keep using local paths in the generated code. Adapt paths to the
-                 target framework convention:
-                   React/Vue   → import coverImg from '@/assets/slices/cover.png'
-                   Flutter     → AssetImage('assets/images/cover.png')
-                   Plain HTML  → <img src="./assets/slices/cover.png">
-              3. NEVER use remote lanhu CDN URLs in any generated code.
-            Additionally, call lanhu_get_design_slices(url, design_name) to get the
-            full slice list for more fine-grained assets (icons, background images, etc.).
-
-        RULE 4 - CROSS-REFERENCE DESIGN TOKENS (SUPPLEMENTARY ONLY):
-            Design Tokens (if present) are extracted from the raw Sketch data.
-            They serve as SUPPLEMENTARY reference for properties that HTML+CSS may
-            not fully express (e.g. complex gradients, multi-stop fills, shadows).
-            Use Design Tokens to ENRICH the code, not to override HTML+CSS values.
-            Only when a CSS property is clearly MISSING (not just different) from the
-            HTML+CSS, use the Design Token value as a supplement.
-            Focus on: gradients, border styles, border-radius, opacity, shadows.
-
-        RULE 5 - POST-GENERATION FIDELITY AUDIT (MANDATORY, NEVER SKIP):
-            After generating code in ANY target platform/language (HTML/CSS, React,
-            Vue, Flutter, SwiftUI, Android Compose, etc.), perform a property-by-property
-            comparison against the design spec HTML+CSS. Map each CSS property to its
-            platform equivalent and verify the value is preserved exactly:
-              ① size constraint: fixed height in spec → must NOT become flexible/wrap
-                  HTML: height not min-height | Flutter: fixed SizedBox, not Flexible
-                  SwiftUI: .frame(height:) not omitted | Compose: height() not wrapContent
-              ② clipping: overflow:hidden in spec → must clip content in all platforms
-                  HTML: overflow:hidden | Flutter: ClipRect/ClipRRect | SwiftUI: .clipped()
-                  Compose: clip()/clipToBounds | Android: android:clipChildren="true"
-              ③ color value: rgba(r,g,b,a) must be converted to platform format exactly
-                  HTML: keep rgba() | Flutter: Color.fromRGBO() | SwiftUI: Color(red:green:blue:opacity:)
-                  Compose: Color(r,g,b,a) | Android XML: #AARRGGBB — values must not drift
-              ④ gradient: linear-gradient must map to platform gradient, not solid color
-                  Flutter: LinearGradient | SwiftUI: LinearGradient | Compose: Brush.linearGradient
-              ⑤ absolute positioning: left/top values must map to exact offsets
-                  Flutter: Positioned(left:,top:) | SwiftUI: .offset() or .position()
-                  Compose: Box+Modifier.offset() | HTML: position:absolute + left/top
-              ⑥ font: family, weight, size must all be preserved; fallback list for HTML
-              ⑦ spacing: every margin/padding direction value must be unchanged
-                  HTML: margin/padding | Flutter: EdgeInsets | SwiftUI: .padding()
-                  Compose: Modifier.padding() | Android: android:layout_margin / android:padding
-              ⑧ image assets: no image replaced by SVG/CSS shape/emoji/placeholder
-              ⑨ element completeness: every visible element in spec must appear in code
-              ⑩ no remote URLs: no lanhu CDN URLs in any generated asset path
-            For each difference found, state explicitly whether it is an intentional
-            platform adaptation (e.g. px→dp unit conversion) or an error (value changed).
-            All errors MUST be corrected before delivering the final code.
-
-        DESIGN IMAGE is for visual verification ONLY. It has the LOWEST priority.
-        NEVER use the design image to override any CSS value from the HTML+CSS code.
+        Visual representation of UI design images and structured design data.
+        output_format='html': return HTML+CSS.
+        output_format='json': temporarily disabled and handled as html.
+        Includes image download mapping with local asset paths.
     """
     extractor = LanhuExtractor()
     try:
@@ -4834,6 +4865,9 @@ async def lanhu_get_ai_analyze_design_result(
         # 下载设计图并生成HTML
         image_results = []
         html_results = []
+        requested_output_format = str(output_format).lower()
+        json_branch_disabled = requested_output_format in ("json", "fgui_json")
+        normalized_output_format = "html"
         
         for design in target_designs:
             # ===== 1. 下载图片 =====
@@ -4874,14 +4908,11 @@ async def lanhu_get_ai_analyze_design_result(
                     params['project_id']
                 )
                 
-                # 转换为 HTML 并压缩（与 TS 端一致，减少 token）
                 html_code = minify_html(convert_lanhu_to_html(schema_json))
-                
-                # 远程图片 URL 替换为本地路径，生成下载映射表
                 html_code, image_url_mapping = _localize_image_urls(html_code, design['name'])
-                
-                # 保存HTML文件
                 html_filename = f"{design['name']}.html"
+                
+                # 保存文件
                 html_filepath = output_dir / html_filename
                 
                 with open(html_filepath, 'w', encoding='utf-8') as f:
@@ -4959,7 +4990,7 @@ async def lanhu_get_ai_analyze_design_result(
         summary_text = f"📊 Design Analysis Results\n"
         summary_text += f"📁 Project: {designs_data['project_name']}\n"
         summary_text += f"✓ {len([r for r in image_results if r['success']])}/{len(image_results)} images downloaded\n"
-        summary_text += f"✓ {html_success_count}/{html_total_count} HTML codes generated\n"
+        summary_text += f"✓ {html_success_count}/{html_total_count} structured code blocks generated\n"
         if sketch_fallback_count > 0:
             summary_text += f"✓ {sketch_fallback_count} design(s) using Sketch annotation fallback (标注模式)\n"
         summary_text += "\n"
@@ -4967,84 +4998,14 @@ async def lanhu_get_ai_analyze_design_result(
         # Show design list with both image and HTML info（每条加显式标题便于多图时对应）
         summary_text += "📋 Design List (display order from top to bottom):\n"
         summary_text += "下方图片顺序与列表中「设计图 1」「设计图 2」… 一一对应，请按序号关联图片与代码。\n\n"
-        summary_text += "🚨 CRITICAL: 设计稿代码使用流程（必须按顺序执行）\n"
-        summary_text += "以下 HTML+CSS 是从设计稿 Schema 生成的【设计规格书】，是所有设计参数的权威来源。\n"
-        summary_text += "⚠️ 权威优先级: HTML+CSS 代码 > Design Tokens 标注 > 设计图图片\n"
-        summary_text += "⚠️ 核心原则: 直接复用 CSS 属性值，禁止修改/简化/美化任何 CSS 值\n\n"
-        summary_text += "STEP 1 - 探测用户项目环境：\n"
-        summary_text += "  读取项目配置文件（package.json / tsconfig.json / pubspec.yaml / build.gradle / Podfile 等）\n"
-        summary_text += "  识别框架: React/Vue/Angular/Svelte/Flutter/SwiftUI/Compose/纯HTML\n"
-        summary_text += "  识别样式方案: CSS Modules / Tailwind / SCSS / Styled Components / scoped style 等\n"
-        summary_text += "  识别项目目录结构和命名规范\n"
-        summary_text += "  如无法判断框架，默认输出纯 HTML 单文件\n\n"
-        summary_text += "STEP 2 - 下载图片资源到本地（必须在生成代码前完成）：\n"
-        summary_text += "  下方每个设计图的 HTML 代码中，图片已替换为本地路径（./assets/slices/xxx.png）\n"
-        summary_text += "  每个设计图下方附有「图片资源下载映射」，列出 本地路径 ← 远程下载地址\n"
-        summary_text += "  必须按映射表下载所有图片到项目本地 assets 目录：\n"
-        summary_text += "    macOS/Linux → curl -o <path> \"<url>\"\n"
-        summary_text += "    Windows → PowerShell Invoke-WebRequest -Uri \"<url>\" -OutFile <path>\n"
-        summary_text += "  如需更多切图（图标、背景等），调用 lanhu_get_design_slices(url, design_name)\n\n"
-        summary_text += "STEP 3 - 生成框架适配代码（直接复用 CSS 值，禁止修改）：\n"
-        summary_text += "  从下方 HTML+CSS 直接复制所有 CSS 属性值（颜色/字号/间距/圆角/渐变等）\n"
-        summary_text += "  ⚠️ 必须原样使用 CSS 值，禁止做任何修改：\n"
-        summary_text += "    - rgba(255,115,10,1) 不要改成 #FF730A\n"
-        summary_text += "    - linear-gradient 不要简化成纯色\n"
-        summary_text += "    - margin/padding 数值不要四舍五入\n"
-        summary_text += "    - font-family 不要删减或重排\n"
-        summary_text += "  按目标框架生成组件代码：\n"
-        summary_text += "    React/Next.js  → JSX + CSS Modules 或跟随项目已有方案\n"
-        summary_text += "    Vue/Nuxt       → .vue SFC + <style scoped>\n"
-        summary_text += "    Angular        → .ts + .html + .css\n"
-        summary_text += "    Flutter        → Widget + EdgeInsets/BoxDecoration，px→逻辑像素\n"
-        summary_text += "    SwiftUI        → View + ViewModifier，px→pt\n"
-        summary_text += "    Android Compose → @Composable + Modifier，px→dp，font px→sp\n"
-        summary_text += "    纯 HTML         → 单个 .html 文件，内联 <style>（含 common.css 工具类）\n"
-        summary_text += "  图片路径按框架约定适配（代码中已是本地路径，只需调整路径格式）：\n"
-        summary_text += "    React/Vue → import img from '@/assets/slices/xxx.png'\n"
-        summary_text += "    Flutter   → AssetImage('assets/images/xxx.png')\n"
-        summary_text += "    纯 HTML   → <img src=\"./assets/slices/xxx.png\">（已就绪）\n\n"
-        summary_text += "STEP 4 - 对照 Design Tokens 补充校验（如下方包含 Design Tokens）：\n"
-        summary_text += "  Design Tokens 来自原始 Sketch 设计数据，作为补充参考。\n"
-        summary_text += "  优先级: HTML+CSS > Design Tokens > 设计图\n"
-        summary_text += "  仅当 HTML+CSS 中明显缺失某属性时，用 Design Token 补充：\n"
-        summary_text += "    如渐变填充、复杂阴影、多边圆角等 CSS 未能完整表达的属性\n"
-        summary_text += "  Design Token 不能覆盖 HTML+CSS 中已有的值。\n\n"
-        summary_text += "STEP 5 - 代码完成后逐属性还原度核查（必须执行，不得跳过）：\n"
-        summary_text += "  适用于所有目标平台：HTML/CSS、React、Vue、Flutter、SwiftUI、Compose、Android XML 等。\n"
-        summary_text += "  将设计稿 HTML+CSS 中每个属性映射到目标平台等价写法，逐一核查值是否还原：\n"
-        summary_text += "  ① 尺寸约束：设计稿固定 height 的地方，目标平台不得变为自适应/wrap\n"
-        summary_text += "     HTML: height 不能改成 min-height | Flutter: SizedBox 不能换成 Flexible\n"
-        summary_text += "     SwiftUI: .frame(height:) 不能省略 | Compose: height() 不能用 wrapContent\n"
-        summary_text += "  ② 裁剪：设计稿 overflow:hidden 的容器，各平台必须同步裁剪\n"
-        summary_text += "     HTML: overflow:hidden | Flutter: ClipRect/ClipRRect | SwiftUI: .clipped()\n"
-        summary_text += "     Compose: clip() | Android: android:clipChildren=\"true\"\n"
-        summary_text += "  ③ 颜色值：rgba(r,g,b,a) 转换到目标平台格式时，数值不得偏移\n"
-        summary_text += "     HTML: 保持 rgba() | Flutter: Color.fromRGBO() | SwiftUI: Color(red:green:blue:opacity:)\n"
-        summary_text += "     Compose: Color(r,g,b,a) | Android XML: #AARRGGBB，禁止四舍五入\n"
-        summary_text += "  ④ 渐变：linear-gradient 必须映射为平台渐变，不能退化为纯色\n"
-        summary_text += "     Flutter: LinearGradient | SwiftUI: LinearGradient | Compose: Brush.linearGradient\n"
-        summary_text += "  ⑤ 绝对定位：left/top 坐标值必须原样映射\n"
-        summary_text += "     Flutter: Positioned(left:,top:) | SwiftUI: .offset() | Compose: Modifier.offset()\n"
-        summary_text += "  ⑥ 字体：family、weight、size 三者都必须还原；HTML 还需保留 fallback 顺序\n"
-        summary_text += "  ⑦ 间距：每个方向的 margin/padding 数值不得改动\n"
-        summary_text += "     Flutter: EdgeInsets | SwiftUI: .padding() | Compose: Modifier.padding()\n"
-        summary_text += "     Android: android:layout_margin / android:padding\n"
-        summary_text += "  ⑧ 图片资源：任何图片不得被 SVG/CSS形状/emoji/占位图替换\n"
-        summary_text += "  ⑨ 元素完整性：设计稿中每个可见元素，目标代码中必须对应存在\n"
-        summary_text += "  ⑩ 远程 URL：最终代码中不得残留任何蓝湖 CDN 远程地址\n"
-        summary_text += "  核查结论：对每处差异明确说明是「有意的平台适配（如 px→dp 单位换算）」\n"
-        summary_text += "  还是「错误偏差（值发生了改变）」，错误偏差必须立即修正后再交付。\n\n"
-        summary_text += "❌ 严禁行为：\n"
-        summary_text += "  - 禁止修改 CSS 属性值（不要改颜色格式、不要简化渐变、不要调整数值）\n"
-        summary_text += "  - 禁止凭空编造设计参数（颜色、尺寸、间距等必须来自下方 CSS）\n"
-        summary_text += "  - 禁止用设计图的视觉感受覆盖 CSS 中的精确值\n"
-        summary_text += "  - 禁止用 SVG/CSS 形状/emoji 替换切图资源\n"
-        summary_text += "  - 禁止省略任何视觉元素\n"
-        summary_text += "  - 禁止在最终代码中使用蓝湖远程 URL\n\n"
-        summary_text += "📐 common.css 工具类含义（用于理解布局意图）：\n"
-        summary_text += "  flex-col = Column 方向布局    flex-row = Row 方向布局\n"
-        summary_text += "  justify-between/center/start/end/around/evenly = 主轴对齐\n"
-        summary_text += "  align-start/center/end = 交叉轴对齐\n\n"
+        
+        if json_branch_disabled:
+            summary_text += "ℹ️ JSON 输出分支已临时关闭，当前请求已按 HTML+CSS 返回。\n\n"
+        summary_text += "📄 HTML 结构化说明\n"
+        summary_text += "以下内容为基于设计 Schema 生成的 HTML+CSS，可作为通用结构与样式参考。\n"
+        summary_text += "图片地址已替换为本地路径（./assets/slices/xxx.png），可结合映射表下载资源。\n"
+        summary_text += "如包含 Design Tokens，可作为补充信息与 HTML+CSS 一起参考。\n"
+        summary_text += "代码生成后必须结合设计底图做视觉对比，并按差异进行效果矫正。\n\n"
         
         success_image_results = [r for r in image_results if r['success']]
         success_html_results = {r['design_name']: r for r in html_results if r['success']}
@@ -5055,8 +5016,9 @@ async def lanhu_get_ai_analyze_design_result(
 
             html_r = success_html_results.get(img_r['design_name'])
             if html_r:
-                summary_text += f"   📄 完整代码（图片已替换为本地路径）:\n"
-                summary_text += f"   ```html\n"
+                summary_text += f"   📄 完整数据（图片已替换为本地路径）:\n"
+                code_block_lang = "html"
+                summary_text += f"   ```{code_block_lang}\n"
                 summary_text += html_r['html_code']
                 summary_text += f"\n   ```\n"
 
@@ -5107,7 +5069,7 @@ async def lanhu_get_ai_analyze_design_result(
                     summary_text += f"     2. 其中 ./assets/designs/design.png 是设计底图，HTML 的 .design 容器用它做 background-image\n"
                     summary_text += f"     3. 每个元素的 data-css 属性包含精确 CSS 标注值，请直接复用到代码中\n"
                     summary_text += f"     4. 文字图层是真实文本（可选中/修改），切图是 <img> 标签\n"
-                    summary_text += f"     5. 调用 lanhu_get_design_slices 可获取更多细粒度切图资源\n\n"
+                    summary_text += f"     5. 代码生成后必须与设计底图做视觉对比，按差异矫正布局、字体、颜色、间距和资源显示\n\n"
 
                     layer_annots = failed_r.get('layer_css_annotations') or []
                     if layer_annots:
@@ -5152,23 +5114,40 @@ async def lanhu_get_ai_analyze_design_result(
             for r in failed_html_results:
                 summary_text += f"  ✗ {r['design_name']}: {r.get('error', 'Unknown')}\n"
 
-        content.append(summary_text)
+        import time
+        result_filename = f"design_analysis_result_{int(time.time())}.txt"
+        result_filepath = output_dir / result_filename
+        with open(result_filepath, 'w', encoding='utf-8') as f:
+            f.write(summary_text)
 
-        # 添加成功的截图
+        instruction_text = (
+            f"🚨 The design analysis result is too large and has been saved to a server-side file to avoid truncation:\n"
+            f"📁 File Path: {result_filepath}\n\n"
+            f"Please use the `lanhu_read_analysis_file` tool provided by this MCP server to read this file in chunks. "
+            f"DO NOT use your local file reading tool, as the file is on the server.\n"
+            f"After code generation, you MUST compare with the design screenshot for visual correction.\n"
+            f"Example: Call lanhu_read_analysis_file(file_path='{result_filepath}', offset=0, limit=500)"
+        )
+        content.append(instruction_text)
+
+        # 添加成功的截图，对于 Image 对象由于 data 可能非常巨大，也返回文件路径指示 AI 按需读取
         for r in image_results:
             if r['success'] and 'screenshot_path' in r:
-                content.append(Image(path=r['screenshot_path']))
+                img_path = r['screenshot_path']
+                content.append(f"🖼️ [Image] {r['design_name']}: Saved at {img_path}. "
+                               f"You MUST use this image for visual comparison and correction. "
+                               f"Use the `lanhu_read_analysis_file` tool: "
+                               f"lanhu_read_analysis_file(file_path='{img_path}')")
 
         return content
     finally:
         await extractor.close()
 
-
-@mcp.tool()
 async def lanhu_get_design_slices(
         url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
         design_name: Annotated[str, "Exact design name (single design only, NOT 'all'). Example: '首页设计', '登录页'. Must match exactly with name from lanhu_get_designs result!"],
         include_metadata: Annotated[bool, "Include color, opacity, shadow info"] = True,
+        slice_scope: Annotated[str, "Slice filter scope: 'marked_only' (default, only explicitly marked slices on Lanhu web) or 'all' (all downloadable slices)."] = "marked_only",
         ctx: Context = None
 ) -> dict:
     """
@@ -5182,6 +5161,7 @@ async def lanhu_get_design_slices(
     
     Returns:
         Slice list with download URLs, AI will handle smart naming and batch download
+        Default returns only slices explicitly marked as slice on Lanhu web.
     """
     extractor = LanhuExtractor()
     try:
@@ -5235,7 +5215,8 @@ async def lanhu_get_design_slices(
             image_id=target_design['id'],
             team_id=params['team_id'],
             project_id=params['project_id'],
-            include_metadata=include_metadata
+            include_metadata=include_metadata,
+            slice_scope=slice_scope
         )
 
         # 5. Add AI workflow guide
@@ -5334,7 +5315,7 @@ async def lanhu_get_design_slices(
             "execution_workflow": {
                 "description": "Complete workflow that AI must autonomously complete",
                 "steps": [
-                    "Step 1: Call lanhu_get_design_slices(url, design_name) to get slice info",
+                    "Step 1: Call lanhu_get_design_slices(url, design_name, slice_scope='marked_only'|'all') to get slice info",
                     "Step 2: Create TODO task plan (use todo_write tool)",
                     "Step 3: Detect current operating system type",
                     "Step 4: Detect available download tools by priority",
@@ -5373,6 +5354,9 @@ async def lanhu_get_design_slices(
         }
     finally:
         await extractor.close()
+
+if ENABLE_DESIGN_SLICES_TOOL:
+    lanhu_get_design_slices = mcp.tool()(lanhu_get_design_slices)
 
 
 # ==================== 团队留言板功能 ====================
@@ -6028,11 +6012,77 @@ async def lanhu_get_members(
     }
 
 
+@mcp.tool()
+async def lanhu_read_analysis_file(
+    file_path: Annotated[str, "The absolute file path returned by lanhu_get_ai_analyze_design_result"],
+    offset: Annotated[int, "Start line number (0-indexed). Ignored for images."] = 0,
+    limit: Annotated[int, "Number of lines to read. Ignored for images."] = 500,
+    ctx: Context = None
+) -> Union[str, Image]:
+    """
+    [Utility] Read large analysis result files or images generated by the Lanhu MCP server.
+    
+    MUST be used when the server returns a file path instead of direct text content.
+    Since the MCP server might be deployed remotely, AI cannot use local file reading tools.
+    Use this tool to read the file content in chunks, or to fetch the image directly.
+    
+    Args:
+        file_path: The absolute path to the result file (e.g. /data/lanhu_designs/...)
+        offset: Starting line number (0 for the beginning). Ignored for images.
+        limit: Number of lines to read at once (max 2000). Ignored for images.
+    """
+    try:
+        import os
+        from pathlib import Path
+        
+        # Limit maximum chunk size
+        limit = min(limit, 2000)
+        
+        # Security check: ensure the file is within DATA_DIR
+        abs_file_path = os.path.abspath(file_path)
+        abs_data_dir = os.path.abspath(DATA_DIR)
+        
+        if not abs_file_path.startswith(abs_data_dir):
+            return f"❌ Error: Access denied. Can only read files within {abs_data_dir}"
+            
+        if not os.path.exists(abs_file_path):
+            return f"❌ Error: File not found at {abs_file_path}"
+            
+        # 如果是图片文件，直接返回 Image 对象
+        if abs_file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+            return Image(path=abs_file_path)
+            
+        with open(abs_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        total_lines = len(lines)
+        if offset >= total_lines:
+            return f"⚠️ Warning: offset {offset} is beyond the total lines {total_lines}."
+            
+        end = min(offset + limit, total_lines)
+        chunk = "".join(lines[offset:end])
+        
+        result = f"📄 Reading {abs_file_path}\n"
+        result += f"📊 Lines {offset} to {end-1} (Total lines: {total_lines})\n"
+        result += "-" * 50 + "\n"
+        result += chunk
+        if not chunk.endswith('\n'):
+            result += "\n"
+        result += "-" * 50 + "\n"
+        
+        if end < total_lines:
+            result += f"💡 There are more lines. Call `lanhu_read_analysis_file` again with offset={end} to read the next chunk."
+        else:
+            result += "✅ End of file reached."
+            
+        return result
+    except Exception as e:
+        return f"❌ Error reading file: {str(e)}"
+
+
 if __name__ == "__main__":
     # 运行MCP服务器
     # 使用HTTP传输方式，支持环境变量配置
     SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
     SERVER_PORT = int(os.getenv("SERVER_PORT", "8100"))
     mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-
-

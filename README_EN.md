@@ -523,7 +523,7 @@ Show all knowledge base messages about "testing"
 | `lanhu_get_ai_analyze_page_result` | Analyze prototype page content | Extract requirement details |
 | `lanhu_get_designs` | Get UI design list | Must call before viewing designs |
 | `lanhu_get_ai_analyze_design_result` | Analyze UI designs | View design drafts |
-| `lanhu_get_design_slices` | Get slice information | Download icons and assets |
+| `lanhu_get_design_slices` | Get slice information | Not exposed to AI by default; set `LANHU_ENABLE_DESIGN_SLICES_TOOL=true` to enable |
 | `lanhu_say` | Post message | Team collaboration, @mentions |
 | `lanhu_say_list` | View message list | Query message history |
 | `lanhu_say_detail` | View message details | View full content |
